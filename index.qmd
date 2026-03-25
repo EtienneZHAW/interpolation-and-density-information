@@ -1,0 +1,121 @@
+# 🚀 Tasks
+
+## Interpolation and Density Estimation
+
+Follow the instructions in Submission via GitHub Pages to create a new repo in the existing organization. Do the exercises in Density Estimation and Interpolation in a file named `index.qmd`
+
+# Interpolation
+
+## Data
+
+---
+
+The airqualtiy dataset (`luftqalitaet.gpkg`) contains measurements of nitrogen dioxide NO2 from 2015 for 97 monitoring sites in Switzerland. Nitrogen dioxide is produced when fuels and combustibles are burned, especially at high combustion temperatures, with road traffic being the main source. You can find more information on this here
+
+
+```{r}
+library(sf)
+library(terra)
+library(tmap)
+library(gstat)
+library(tidyverse)
+
+```
+
+
+```{r}
+air_quality <- sf::st_read("data/luftqualitaet.gpkg")
+
+sf::st_crs(air_quality) <- 2056
+
+swiss_polygon <- sf::st_read("data/swissBOUNDARIES3D_1_5_LV95_LN02.gdb", layer = "TLM_LANDESGEBIET") %>%
+                    st_transform(crs = st_crs(air_quality))
+
+```
+```{r}
+
+tm_shape(air_quality) +
+    tm_polygons()
+```
+
+As expected, a bunch of points. Nothing more, nothing less.
+
+```{r}
+grid <- sf::st_make_grid(air_quality , 
+        cellsize = 3000, 
+        what = "centers",
+        ) %>%
+    sf::st_as_sf(
+        crs = sf::st_crs(air_quality) 
+    ) %>%
+    sf::st_filter(swiss_polygon, .predicate = st_within)
+
+```
+
+```{r}
+idw_result <- gstat::idw(
+    formula = value ~ 1,
+    locations = air_quality,
+    newdata = grid,
+    idp = 6
+)
+
+idw_result
+```
+
+
+`st_make_grid` creates a regular grid covering the bounding box of the input object. The key parameters are:
+
+- **`x`**: the spatial object whose bounding box defines the grid extent
+- **`cellsize`**: the size of each cell in the CRS units (here metres, since Swiss LV95 is metric) — `5000` means 5 km spacing between points
+- **`what`**: what to return — `"polygons"` (default) gives grid squares, `"centers"` gives the centre point of each cell, `"corners"` gives the corner points
+
+We pipe to `st_as_sf()` so the result is an `sf` data frame, which is the format `gstat::idw()` expects for `newdata`.
+
+
+```{r}
+
+
+preds <- idw_result %>%
+    sf::st_drop_geometry() %>%
+    select(var1.pred) %>%
+    as_tibble()
+
+idw_result %>%
+    st_coordinates() %>%
+    as_tibble() %>%
+    mutate(
+        interpolated_values = preds
+    ) %>% 
+        unpack(interpolated_values) %>% 
+        terra::rast(type="xyz") %>% plot()
+
+```
+
+
+```{r}
+
+tm_shape(idw_result) +
+    tm_polygons()
+
+```
+
+## Thiessen Polygons (Voronoi interpolation)
+
+Thiessen polygons are the simplest form of spatial interpolation: every location in space is assigned the value of its **nearest measurement point**. The boundary between two polygons is always equidistant from the two stations on either side.
+
+`sf::st_voronoi` works on a **geometry collection**, not on individual points, so the workflow has a few steps:
+
+```{r}
+voronoi <- air_quality %>%
+    sf::st_geometry() %>%               # extract the point geometries (sfc)
+    sf::st_union() %>%                  # collapse into one MULTIPOINT geometry collection
+    sf::st_voronoi() %>%                # compute the Voronoi tessellation (returns GEOMETRYCOLLECTION)
+    sf::st_collection_extract("POLYGON") %>%  # unpack individual polygons
+    sf::st_as_sf() %>%                  # wrap in an sf data frame
+    sf::st_intersection(swiss_polygon) %>%    # clip to Switzerland
+    sf::st_join(air_quality)            # attach the NO2 values from the nearest station
+
+tm_shape(voronoi) +
+    tm_polygons(fill = "value", fill.scale = tm_scale_continuous())
+```

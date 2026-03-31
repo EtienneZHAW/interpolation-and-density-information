@@ -1,3 +1,17 @@
+---
+title: "Interpolation and Density Estimation: Tasks"
+author: "Etienne"
+date: today
+format:
+  html:
+    embed-resources: true
+    toc: true
+    toc-location: right
+engine: knitr
+execute:
+  freeze: auto
+---
+
 # 🚀 Tasks
 
 ## Interpolation and Density Estimation
@@ -8,70 +22,99 @@ Follow the instructions in Submission via GitHub Pages to create a new repo in t
 
 ## Data
 
----
-
 The airqualtiy dataset (`luftqalitaet.gpkg`) contains measurements of nitrogen dioxide NO2 from 2015 for 97 monitoring sites in Switzerland. Nitrogen dioxide is produced when fuels and combustibles are burned, especially at high combustion temperatures, with road traffic being the main source. You can find more information on this here
+
+## Reading in Data and Explore
+
 
 
 ```{r}
+#| message: false
+#| warning: false
+
 library(sf)
 library(terra)
 library(tmap)
 library(gstat)
 library(tidyverse)
-
+library(spatstat)
 ```
 
+In order to read in I am using `sf` geopakage parser. For exercies 1 I also need a polygon that delimits the swiss national teretorium. This can be gotten from the `swissBOUNDARIES3D` dataset. So I am reading this in too. For some reason I also have to correctly set the swiss CRS for the `swissBOUNDARIES3D` data. This is luckely provided in the air quality data, so I do not have to look up any `EPSG` codes.
 
 ```{r}
-air_quality <- sf::st_read("data/luftqualitaet.gpkg")
+#| message: false
+#| warning: false
+
+air_quality <- sf::st_read("data/luftqualitaet.gpkg", quiet = TRUE)
 
 sf::st_crs(air_quality) <- 2056
 
-swiss_polygon <- sf::st_read("data/swissBOUNDARIES3D_1_5_LV95_LN02.gdb", layer = "TLM_LANDESGEBIET") %>%
-                    st_transform(crs = st_crs(air_quality))
-
+swiss_polygon <- sf::st_read("data/swissBOUNDARIES3D_1_5_LV95_LN02.gdb", layer = "TLM_LANDESGEBIET", quiet = TRUE) %>%
+st_transform(crs = st_crs(air_quality))
 ```
+
+Lets Inspect the data. For this I am using tmap, as it allows for an easy little Dashboard to explore the data
+
 ```{r}
+
+tmap_mode("view")
 
 tm_shape(air_quality) +
     tm_polygons()
 ```
 
-As expected, a bunch of points. Nothing more, nothing less.
+As expected, a bunch of points with values. 
+
+
+## Exercise 1: IDW
+
+
+## Solution 1: IDW
+
+---
+
+
+
+First, a grid needs to be created with `sf::st_make_grid`. The `cellsize` argument defines the edge length of each square grid cell in map units (here meters). So `cellsize = 5000` produces a grid of 5000 m × 5000 m squares, and `what = "centers"` returns the centroid of each cell as the prediction location. Smaller cell sizes yield a finer resolution but are heavier to compute. I am using `sf::st_filter` to filter out points which do not lie in Switzerland. This is necessary because `sf::st_make_grid` simply produces a rectangular grid, which would then also include regions of the neighbouring countries.
+
 
 ```{r}
-grid <- sf::st_make_grid(air_quality , 
-        cellsize = 3000, 
+#| message: false
+#| warning: false
+
+grid <- sf::st_make_grid(
+swiss_polygon ,
+        cellsize = 5000,
         what = "centers",
         ) %>%
     sf::st_as_sf(
-        crs = sf::st_crs(air_quality) 
+        crs = sf::st_crs(air_quality)
     ) %>%
     sf::st_filter(swiss_polygon, .predicate = st_within)
-
 ```
 
+Lets have a look on how this grid looks like:
 ```{r}
+tm_shape(grid) +
+    tm_polygons()
+```
+
+Looks decent. All the interpolation points lie within Switzerland. Then lets go ahead and perform nearest neighbour Interpolation.
+
+```{r}
+#| message: false
+
 idw_result <- gstat::idw(
     formula = value ~ 1,
     locations = air_quality,
     newdata = grid,
-    idp = 6
+    idp = 2
 )
 
-idw_result
 ```
 
-
-`st_make_grid` creates a regular grid covering the bounding box of the input object. The key parameters are:
-
-- **`x`**: the spatial object whose bounding box defines the grid extent
-- **`cellsize`**: the size of each cell in the CRS units (here metres, since Swiss LV95 is metric) — `5000` means 5 km spacing between points
-- **`what`**: what to return — `"polygons"` (default) gives grid squares, `"centers"` gives the centre point of each cell, `"corners"` gives the corner points
-
-We pipe to `st_as_sf()` so the result is an `sf` data frame, which is the format `gstat::idw()` expects for `newdata`.
-
+Concerting the interpolated grid to a raster can be done using `terra`. For this I am first creating a Dataframe where each row represents a interpolated point. The dataframe holds three columns. The third column holds the interpolated NO_2 concentrations the first and second column hold the coordinates of the point.
 
 ```{r}
 
@@ -81,32 +124,109 @@ preds <- idw_result %>%
     select(var1.pred) %>%
     as_tibble()
 
-idw_result %>%
+prediction_df <- idw_result %>%
     st_coordinates() %>%
     as_tibble() %>%
     mutate(
         interpolated_values = preds
     ) %>% 
-        unpack(interpolated_values) %>% 
-        terra::rast(type="xyz") %>% plot()
+        unpack(interpolated_values)
+
+prediction_df %>% head()
+```
+
+Then `terra::rast` can be used to create a raster from the dataframe using `type="xyz"`. This tells terra that the first two columns will the coordinates, and the third column holds a point attribute.
+
+
+```{r}
+interpolation_raster <- prediction_df %>% 
+    terra::rast(type="xyz")
+```
+
+
+
+```{r}
+plot(interpolation_raster)
+# calude: Use tmap here for displaing.
+# also set title to graphic if applicable. Generally for all plots, they should have a title if possible
 
 ```
 
 
+
+### Parameter Exploration
+
+The exercise asks to vary `idp`, `nmax` / `nmix`, and `maxdist`. I did that. Below I will discus the effect of the parameters for a specific case where I vary `idp` and `nmax`. The low vacet plots shows the result of nearest neighbour interpolations for the parameters `idp` ∈ {1, 2, 5} and `nmax` ∈ {10, 30, Inf} (where Inf means all stations contribute). Each result is rasterised and displayed in a 3×3 facet grid.
+
 ```{r}
+#| message: false
+#| warning: false
 
-tm_shape(idw_result) +
-    tm_polygons()
+idp_values  <- c(1, 2, 5)
+nmax_values <- c(10, 30, Inf)
 
+param_grid <- expand.grid(idp = idp_values, nmax = nmax_values)
+
+idw_to_raster <- function(idp, nmax, locations, newdata) {
+  nmax_arg <- if (is.infinite(nmax)) Inf else nmax
+  result <- gstat::idw(
+    formula  = value ~ 1,
+    locations = locations,
+    newdata   = newdata,
+    idp       = idp,
+    nmax      = nmax_arg
+  )
+  coords <- st_coordinates(result)
+  vals   <- result$var1.pred
+  df     <- data.frame(X = coords[,1], Y = coords[,2], value = vals)
+  terra::rast(df, type = "xyz", crs = st_crs(air_quality)$wkt)
+}
+
+raster_list <- purrr::pmap(param_grid, function(idp, nmax) {
+  idw_to_raster(idp, nmax, air_quality, grid)
+})
+
+tmap_mode("plot")
+
+map_list <- purrr::pmap(list(raster_list, param_grid$idp, param_grid$nmax), function(r, idp, nmax) {
+  nmax_label <- if (is.infinite(nmax)) "all" else as.character(nmax)
+  tm_shape(r) +
+    tm_raster(
+      col = "value",
+      col.scale = tm_scale_continuous(values = "brewer.yl_or_rd"),
+      col.legend = tm_legend(show = FALSE)
+    ) +
+    tm_title(text = paste0("idp=", idp, ", nmax=", nmax_label))
+})
+
+tmap_arrange(maps = map_list, ncol = 3, nrow = 3)
 ```
 
-## Thiessen Polygons (Voronoi interpolation)
+### Interpretation
 
-Thiessen polygons are the simplest form of spatial interpolation: every location in space is assigned the value of its **nearest measurement point**. The boundary between two polygons is always equidistant from the two stations on either side.
 
-`sf::st_voronoi` works on a **geometry collection**, not on individual points, so the workflow has a few steps:
+When reading the visualisation row-whise, one can deduce the effect of different `inverse distance weighting powers` (idp) on the calculation. The pattern is more plurred out for low idp values and becomes more and more varied and distinct for higher idp values. This, because for large idp values a specific measuring point also contributes meaningfully to further distanced interpolation points. So two neighbouring interpolated points are rather similar in nature, as they get influenced by the same large group of neighbouring points. As idp increases however, the influence of a measurement point on a interpolated point drops much quicker with distance. As an effect, two neighbouring interpolated points suddently get influenced by mostly different measured points. They therefore are also very different in nature as a results the whole graphic is less "smeared out".
+
+When reading the visualisaiton column-whise on can study theh influence of nmax. The first row provides a great example. For larger values of `nmax` the differences in NO_2 concentration get blurrier. This is because for larger nmax, each minterpolation point gets influenced by more and more measuring points. Ergo two neighbouring interpolation points become similar and similar, as the set of measurement points that influence both interpolation points gets larger, hence the neighbouring points become more similar.
+
+The lower left and the upper right conner show extreme cases. Here the homogenizing effect of having a slow weighting decay and the maximal number of measuring points involved in the calculation, yields a smeared out / blurry results. In the upper right, having a fast decay and a small number of points for calculation yields very sharp boundaries.
+
+
+### Exercise 2: Nearest Neighbour
+
+Another simple option for interpolation is the nearest neighbour approach, that we can recreate using voronoi polygons. Use the approach described in Exercise 2: Voronoi to create voronoi polygons. Turn the resulting `sfc` object to `sf` using `st_as_sf`, then use `st_join` to add the measured NO2 values to the polygons.
+
+Visualize the result
+
+
+
+### Solution 2
+---
 
 ```{r}
+#| message: false
+#| warning: false
+
 voronoi <- air_quality %>%
     sf::st_geometry() %>%               # extract the point geometries (sfc)
     sf::st_union() %>%                  # collapse into one MULTIPOINT geometry collection
@@ -118,4 +238,104 @@ voronoi <- air_quality %>%
 
 tm_shape(voronoi) +
     tm_polygons(fill = "value", fill.scale = tm_scale_continuous())
+
+# @claude: Here the value bar is covering part of western switzerland. Further add ad title here if applicable.
 ```
+
+This example shows some shortcomings of Voronoi Polygons quite neatly.
+
+1. The interpolation is not continuous (as you get into higher mathematics, for some reason everyone gets obsessed with having continuous smooth phenomena, not shure wheter this is just me). Technically not realy that much of a problem, but for NO2 concentration it is just unrealistic. The concentration of a gas in the air is for shure continuous and not a discretely changing phenomenon.
+
+2. Large regions have the exact same value of NO2. This is of course also not realy realistic, since for a gas we can assume that its concentration decreases with the distance of emmitance. Hence, having patches with exactly the same value does not correctly model, how gas concentrations realy behave in the atmosphere.
+
+
+## Density Estimation
+
+### Data
+
+The data set rotmilan.gpkg originates from a larger research project of the Sempach Ornithological Institute which can be accessed via the movebank platform (see Scherler 2020). This is a single individual that has been fitted with a transmitter since 2017 and is travelling across the whole of Central Europe. In this exercise, we only work with the data points that were recorded in Switzerland. If you would like to analyse the entire data set, you can download it via the Movebank link.
+
+### Reading in the Red Kite Data
+
+```{r}
+#| message: false
+#| warning: false
+
+rotmilan <- sf::st_read("data/rotmilan.gpkg", quiet = TRUE)
+```
+
+### Exercise 1: Kernel Density Estimation
+
+To calculate a 2D kernel density over the red kite data, we use the function `density` from the R package `spatstat`. The point pattern is converted to class `ppp` using `as.ppp`. We then compare four automatic bandwidth selectors: `bw.diggle`, `bw.CvL`, `bw.scott`, and `bw.ppl`.
+
+```{r}
+#| message: false
+#| warning: false
+
+rotmilan_ppp <- as.ppp(rotmilan)
+swiss_vect <- terra::vect(swiss_polygon)
+
+
+bw_methods <- list(
+  "bw.diggle" = bw.diggle,
+  "bw.CvL"    = bw.CvL,
+  "bw.scott"  = function(x) bw.scott(x, isotropic = TRUE),
+  "bw.ppl"    = bw.ppl
+)
+
+kde_rasters <- lapply(names(bw_methods), function(name) {
+  sigma_val <- bw_methods[[name]](rotmilan_ppp)
+  cat(name, ": sigma =", round(as.numeric(sigma_val), 1), "m\n")
+  density(rotmilan_ppp, sigma = sigma_val, kernel = "gaussian", eps = 1000) %>%
+    terra::rast() %>%:
+    terra::crop(swiss_vect) %>%
+    terra::mask(swiss_vect)
+})
+
+names(kde_rasters) <- names(bw_methods)
+```
+```{r}
+tmap_mode("plot")
+
+kde_maps <- lapply(names(kde_rasters), function(name) {
+  tm_shape(kde_rasters[[name]]) +
+    tm_raster(
+      col = names(kde_rasters[[name]]),
+      col.scale = tm_scale_continuous(values = "brewer.yl_or_rd"),
+      col.legend = tm_legend(show = FALSE)
+    ) +
+    tm_title(text = name)
+})
+
+tmap_arrange(maps = kde_maps, ncol = 2, nrow = 2)
+```
+
+### Interpretation
+
+*TODO: Compare the four bandwidth selectors. Which produces the smoothest surface? Which picks up the finest detail? Which seems most appropriate for this dataset and why?*
+
+### Exercise 2: Voronoi / Thiessen Polygons (Density)
+
+Thiessen polygons offer an alternative for visualising differences in the density distribution of point data. Smaller polygons indicate areas where observations are denser.
+
+```{r}
+#| message: false
+#| warning: false
+
+voronoi_density <- rotmilan %>%
+    sf::st_geometry() %>%
+    sf::st_union() %>%
+    sf::st_voronoi() %>%
+    sf::st_collection_extract("POLYGON") %>%
+    sf::st_as_sf() %>%
+    sf::st_intersection(swiss_polygon)
+
+tmap_mode("view")
+
+tm_shape(voronoi_density) +
+    tm_polygons(fill = "lightblue", col = "grey40", lwd = 0.3)
+```
+
+### Interpretation
+
+*TODO: Interpret the Voronoi density visualisation. Where are the densest clusters of red kite observations? How does this compare to the KDE results?*
